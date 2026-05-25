@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 data/Levels_Fyi_Salary_Data.csv
+data/aijobs_net_raw.csv
