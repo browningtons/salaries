@@ -1,91 +1,167 @@
+"""Data pipeline for the levels.fyi salary revival project.
 
-import pandas as pd
-import requests
-import numpy as np
-import math
-from datetime import timedelta
+Loads the Kaggle "Data Science and STEM Salaries" dump (mirrored on GitHub),
+cleans it, and classifies rows into a data-role taxonomy:
+  - Data Scientist
+  - Business Analyst   (closest stand-in for Data Analyst)
+  - Data Engineer      (Software Engineer + Data tag)
+  - ML Engineer        (Software Engineer + ML/AI tag)
+
+The original script pulled from https://www.levels.fyi/js/salaryData.json,
+which now returns 403. We use a GitHub mirror of the Kaggle dataset instead.
+"""
+from __future__ import annotations
+
+import os
 import re
+from pathlib import Path
 
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import pygsheets
+import numpy as np
+import pandas as pd
 
-data = requests.get('https://www.levels.fyi/js/salaryData.json').json()
-df = pd.DataFrame(data)
+DATA_DIR = Path(__file__).parent / "data"
+RAW_PATH = DATA_DIR / "Levels_Fyi_Salary_Data.csv"
+CLEAN_PATH = DATA_DIR / "analyst_salaries_clean.csv"
+MIRROR_URL = (
+    "https://raw.githubusercontent.com/ChrisGardnerPSU/"
+    "Big-Tech-Salary-Analysis/main/Levels_Fyi_Salary_Data.csv"
+)
 
-# Remove columns that we don't need
-df = df.drop(['cityid','rowNumber','dmaid'], axis=1)
-df = df.replace("", np.nan)
+DATA_ROLES = ["Data Scientist", "Business Analyst", "Data Engineer", "ML Engineer"]
 
-#convert datatypes
-num_cols = ['yearsofexperience','basesalary','bonus','stockgrantvalue',
-            'totalyearlycompensation','yearsatcompany']
-df[num_cols] = df[num_cols].apply(pd.to_numeric)
+ML_TAGS = {"ML / AI", "ML", "ML/AI", "Machine Learning", "Data Science"}
+DATA_TAGS = {"Data", "Analytics", "Analytic"}
 
-#one record without a location, kick it out
-df = df[df.location.notnull()]
 
-#round up all of the years of experience even if it is 0.25 years
-df['yearsofexperience'] = np.ceil(df.yearsofexperience)
-df['yearsatcompany'] = np.ceil(df.yearsatcompany)
+def fetch_raw(force: bool = False) -> Path:
+    """Download the raw CSV if it isn't already cached locally."""
+    DATA_DIR.mkdir(exist_ok=True)
+    if force or not RAW_PATH.exists():
+        import urllib.request
+        urllib.request.urlretrieve(MIRROR_URL, RAW_PATH)
+    return RAW_PATH
 
-#remove records that fall in the top/bottom 95th/5th percentile on totalyearly compensation
-#I do this to remove some of the submissions that say they are making $5 million a year or those that are next to nothing
-df = df[df['totalyearlycompensation'].between(df['totalyearlycompensation']. \
-                                              quantile(.05),df['totalyearlycompensation'].quantile(.95))]
 
-#remove records that are outside of the US. This definition is any location record that has 2 commas or more but keep remote workers
-df = df[(df['location'].str.count(',') == 1) | (df['location'].str.contains('remote',flags=re.IGNORECASE, regex=True))]
+def load_raw() -> pd.DataFrame:
+    fetch_raw()
+    return pd.read_csv(RAW_PATH)
 
-#change timestampe to date
-df['timestamp'] = pd.to_datetime(df['timestamp'])
-df['city'] = df['location'].str.split(",").str[0]
-df['state'] = df['location'].str[-2:]
 
-#strip any leading or trailing spaces
-ob_cols = df.select_dtypes(include=['object']).columns.tolist()
+def classify_role(row: pd.Series) -> str | None:
+    title = row["title"]
+    tag = row.get("tag")
+    if title == "Data Scientist":
+        return "Data Scientist"
+    if title == "Business Analyst":
+        return "Business Analyst"
+    if title == "Software Engineer":
+        if tag in ML_TAGS:
+            return "ML Engineer"
+        if tag in DATA_TAGS:
+            return "Data Engineer"
+    return None
 
-for col in df[ob_cols]:
-    df[col] = df[col].str.strip()
 
-#duplicates and fuzzy match company name clean up
-company_dict = {'JP Morgan Chase':'JPMorgan Chase','JPMORGAN':'JPMorgan Chase','JP Morgan':'JPMorgan Chase','JPMorgan':'JPMorgan Chase','JP morgan':'JPMorgan Chase',
-				'Jp Morgan':'JPMorgan Chase','jp morgan':'JPMorgan Chase', 'Jp morgan chase':'JPMorgan Chase',
-				'Ford Motor':'Ford','Ford Motor Company':'Ford',
-				'Johnson and Johnson':'Johnson & Johnson',
-				'Juniper':'Juniper Networks','juniper':'Juniper Networks',
-				'HP':'HP Inc','Hewlett Packard Enterprise':'HPE',
-				'Hsbc':'HSBC',
-				'Amazon web services':'Amazon',
-				'Apple Inc.':'Apple',
-				'Bosch Global':'Bosch',
-				'Deloitte Advisory':'Deloitte','Deloitte Consulting':'Deloitte','Deloitte consulting':'Deloitte',
-				'DISH':'DISH Network','Dish Network':'DISH Network','Dish':'DISH Network',
-				'Disney Streaming Services':'Disney','The Walt Disney Company':'Disney',
-				'Epic':'Epic Systems',
-				'Ernst and Young':'Ernst & Young',
-				'Expedia Group':'Expedia',
-				'Qualcomm Inc':'Qualcomm',
-				'Raytheon Technologies':'Raytheon',
-				'MSFT':'Microsoft','Microsoft Corporation':'Microsoft','Msft':'Microsoft','microsoft corporation':'Microsoft',
-				'Snapchat':'Snap',
-				'Sony Interactive Entertainment':'Sony',
-				'Micron':'Micron Technology',
-				'Mckinsey & Company':'McKinsey',
-				'Jane Street':'Jane Street Capital',
-				'EPAM':'EPAM Systems',
-				'Costco Wholesale':'Costco',
-				'Akamai Technology':'Akamai','Akamai Technologies':'Akamai',
-				'Visa inc':'Visa',
-				'Wipro Limited':'Wipro',
-				'Zoominfo':'Zoom',
-				'Zillow Group':'Zillow'}
-df['company'] = df['company'].map(company_dict).fillna(df['company'])
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.drop(columns=["cityid", "rowNumber", "dmaid"], errors="ignore")
+    df = df.replace("", np.nan)
 
-#once you have the final dataframe, now it is time to paste it into google sheets
-pycred = pygsheets.authorize(service_file='/Users/paul.brown/Documents/Python/credentials.json')
-#opening the gsheet and sheet you want to work with
-ss = pycred.open_by_key('1CuQDfKALqxxKdYvsudhkRjXelriZktT7QxaDHQGFjeU')[0]
-#overwrite what is in the sheet with your df
-ss.set_dataframe(df,(1,1))
+    num_cols = [
+        "yearsofexperience", "basesalary", "bonus",
+        "stockgrantvalue", "totalyearlycompensation", "yearsatcompany",
+    ]
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
 
+    df = df[df["location"].notna()]
+    df["yearsofexperience"] = np.ceil(df["yearsofexperience"])
+    df["yearsatcompany"] = np.ceil(df["yearsatcompany"])
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df[df["timestamp"].notna()]
+    df["year"] = df["timestamp"].dt.year
+    df["quarter"] = df["timestamp"].dt.to_period("Q").astype(str)
+    df["year_month"] = df["timestamp"].dt.to_period("M").astype(str)
+
+    is_us = df["location"].str.count(",").eq(1)
+    is_remote = df["location"].str.contains("remote", flags=re.IGNORECASE, regex=True, na=False)
+    df = df[is_us | is_remote].copy()
+    df["city"] = df["location"].str.split(",").str[0].str.strip()
+    remote_mask = df["location"].str.contains("remote", flags=re.IGNORECASE, regex=True, na=False)
+    df["state"] = np.where(remote_mask, "Remote", df["location"].str[-2:].str.strip())
+
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].str.strip()
+
+    df["company"] = df["company"].map(_company_aliases()).fillna(df["company"])
+    return df
+
+
+def to_analyst_family(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only rows that map to one of the four data roles, then trim outliers per role."""
+    df = df.copy()
+    df["role"] = df.apply(classify_role, axis=1)
+    df = df[df["role"].notna()]
+
+    # Per-role 5th-95th percentile trim on total comp.
+    bounds = df.groupby("role")["totalyearlycompensation"].quantile([0.05, 0.95]).unstack()
+    bounds.columns = ["lo", "hi"]
+    df = df.join(bounds, on="role")
+    df = df[df["totalyearlycompensation"].between(df["lo"], df["hi"])]
+    return df.drop(columns=["lo", "hi"]).reset_index(drop=True)
+
+
+def build() -> pd.DataFrame:
+    """End-to-end: raw -> clean -> filter -> save."""
+    df = clean(load_raw())
+    df = to_analyst_family(df)
+    DATA_DIR.mkdir(exist_ok=True)
+    df.to_csv(CLEAN_PATH, index=False)
+    return df
+
+
+def _company_aliases() -> dict[str, str]:
+    return {
+        "JP Morgan Chase": "JPMorgan Chase", "JPMORGAN": "JPMorgan Chase",
+        "JP Morgan": "JPMorgan Chase", "JPMorgan": "JPMorgan Chase",
+        "JP morgan": "JPMorgan Chase", "Jp Morgan": "JPMorgan Chase",
+        "jp morgan": "JPMorgan Chase", "Jp morgan chase": "JPMorgan Chase",
+        "Ford Motor": "Ford", "Ford Motor Company": "Ford",
+        "Johnson and Johnson": "Johnson & Johnson",
+        "Juniper": "Juniper Networks", "juniper": "Juniper Networks",
+        "HP": "HP Inc", "Hewlett Packard Enterprise": "HPE",
+        "Hsbc": "HSBC",
+        "Amazon web services": "Amazon",
+        "Apple Inc.": "Apple",
+        "Bosch Global": "Bosch",
+        "Deloitte Advisory": "Deloitte", "Deloitte Consulting": "Deloitte",
+        "Deloitte consulting": "Deloitte",
+        "DISH": "DISH Network", "Dish Network": "DISH Network", "Dish": "DISH Network",
+        "Disney Streaming Services": "Disney", "The Walt Disney Company": "Disney",
+        "Epic": "Epic Systems",
+        "Ernst and Young": "Ernst & Young",
+        "Expedia Group": "Expedia",
+        "Qualcomm Inc": "Qualcomm",
+        "Raytheon Technologies": "Raytheon",
+        "MSFT": "Microsoft", "Microsoft Corporation": "Microsoft",
+        "Msft": "Microsoft", "microsoft corporation": "Microsoft",
+        "Snapchat": "Snap",
+        "Sony Interactive Entertainment": "Sony",
+        "Micron": "Micron Technology",
+        "Mckinsey & Company": "McKinsey",
+        "Jane Street": "Jane Street Capital",
+        "EPAM": "EPAM Systems",
+        "Costco Wholesale": "Costco",
+        "Akamai Technology": "Akamai", "Akamai Technologies": "Akamai",
+        "Visa inc": "Visa",
+        "Wipro Limited": "Wipro",
+        "Zoominfo": "Zoom",
+        "Zillow Group": "Zillow",
+    }
+
+
+if __name__ == "__main__":
+    df = build()
+    print(f"rows: {len(df):,}")
+    print(df["role"].value_counts())
+    print(f"saved -> {CLEAN_PATH}")
