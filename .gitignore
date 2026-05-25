@@ -1,0 +1,4 @@
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+data/Levels_Fyi_Salary_Data.csv
